@@ -153,6 +153,7 @@ func getHideServiceModules(workflow *commonmodels.Workflow) sets.String {
 	return hideServiceModules
 }
 
+// Deprecated: Use getProjectTargetsFromServices instead to avoid repeated queries
 func getProjectTargets(productName string) []string {
 	var targets []string
 	productTmpl, err := template.NewProductColl().Find(productName)
@@ -166,6 +167,12 @@ func getProjectTargets(productName string) []string {
 		return targets
 	}
 
+	return getProjectTargetsFromServices(services)
+}
+
+// Optimized version that accepts preloaded services
+func getProjectTargetsFromServices(services []*commonmodels.Service) []string {
+	var targets []string
 	for _, serviceTmpl := range services {
 		switch serviceTmpl.Type {
 		case setting.K8SDeployType, setting.HelmDeployType:
@@ -180,7 +187,8 @@ func getProjectTargets(productName string) []string {
 	return targets
 }
 
-func findModuleByContainer(productName, serviceModuleTarget string, buildStageModules []*commonmodels.BuildModule, allModules []*commonmodels.Build, log *zap.SugaredLogger) (*commonmodels.Build, *commonmodels.ServiceModuleTarget) {
+// Optimized version that accepts preloaded data to avoid N+1 queries
+func findModuleByContainer(productName, serviceModuleTarget string, buildStageModules []*commonmodels.BuildModule, allModules []*commonmodels.Build, services []*commonmodels.Service, log *zap.SugaredLogger) (*commonmodels.Build, *commonmodels.ServiceModuleTarget) {
 	// find build name
 	var buildName string
 	for _, buildStageModule := range buildStageModules {
@@ -193,19 +201,9 @@ func findModuleByContainer(productName, serviceModuleTarget string, buildStageMo
 			break
 		}
 	}
-	if buildName == "" {
+	if buildName == "" && services != nil {
 		// Compatible with old data if buildName is empty
-		productTmpl, err := template.NewProductColl().Find(productName)
-		if err != nil {
-			log.Errorf("failed to find project,err:%s", err)
-			return nil, nil
-		}
-		services, err := commonrepo.NewServiceColl().ListMaxRevisionsForServices(productTmpl.AllServiceInfos(), "")
-		if err != nil {
-			log.Errorf("failed to list services,err:%s", err)
-			return nil, nil
-		}
-
+		// Use preloaded services to avoid repeated database queries
 		for _, serviceTmpl := range services {
 			if serviceTmpl.Type != setting.PMDeployType {
 				for _, container := range serviceTmpl.Containers {
@@ -369,8 +367,29 @@ func PresetWorkflowArgs(namespace, workflowName string, log *zap.SugaredLogger) 
 		return resp, e.ErrListTestModule.AddDesc(err.Error())
 	}
 
+	// Preload productTmpl and services to avoid N+1 queries in the loop
+	productTmpl, err := template.NewProductColl().Find(workflow.ProductTmplName)
+	if err != nil {
+		log.Errorf("ProductTmpl.Find error: %v", err)
+		return resp, e.ErrFindProduct.AddDesc(err.Error())
+	}
+
+	projectServices, err := commonrepo.NewServiceColl().ListMaxRevisionsForServices(productTmpl.AllServiceInfos(), "")
+	if err != nil {
+		log.Errorf("ServiceTmpl.ListMaxRevisions error: %v", err)
+		// Continue with nil services - will fallback to old behavior if needed
+		projectServices = nil
+	}
+
 	targetMap, imageNameM := commonservice.GetProductTargetMap(product)
-	projectTargets := getProjectTargets(product.ProductName)
+	// Use optimized version with preloaded services
+	var projectTargets []string
+	if projectServices != nil {
+		projectTargets = getProjectTargetsFromServices(projectServices)
+	} else {
+		// Fallback to old method if preloading failed
+		projectTargets = getProjectTargets(product.ProductName)
+	}
 	hideServiceModules := getHideServiceModules(workflow)
 	targets := make([]*commonmodels.TargetArgs, 0)
 	if (workflow.BuildStage != nil && workflow.BuildStage.Enabled) || (workflow.ArtifactStage != nil && workflow.ArtifactStage.Enabled) {
@@ -396,7 +415,7 @@ func PresetWorkflowArgs(namespace, workflowName string, log *zap.SugaredLogger) 
 				HasBuild:    true,
 			}
 
-			moBuild, targetInfo := findModuleByContainer(workflow.ProductTmplName, container, workflow.BuildStage.Modules, allModules, log)
+			moBuild, targetInfo := findModuleByContainer(workflow.ProductTmplName, container, workflow.BuildStage.Modules, allModules, projectServices, log)
 			if moBuild == nil {
 				moBuild = &commonmodels.Build{}
 				target.HasBuild = false

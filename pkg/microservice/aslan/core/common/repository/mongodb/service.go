@@ -132,6 +132,16 @@ func (c *ServiceColl) EnsureIndex(ctx context.Context) error {
 			},
 			Options: options.Index().SetUnique(false),
 		},
+		{
+			// Optimized index for listMaxRevisions queries
+			Keys: bson.D{
+				bson.E{Key: "status", Value: 1},
+				bson.E{Key: "product_name", Value: 1},
+				bson.E{Key: "service_name", Value: 1},
+				bson.E{Key: "revision", Value: -1},
+			},
+			Options: options.Index().SetUnique(false),
+		},
 	}
 
 	// 仅用于升级 release v1.3.1, 将在下一版本移除
@@ -153,26 +163,27 @@ type serviceID struct {
 }
 
 func (c *ServiceColl) ListMaxRevisionsForServices(services []*templatemodels.ServiceInfo, serviceType string) ([]*models.Service, error) {
-	var srs []bson.D
+	// Build $or conditions for efficient filtering in first $match stage
+	var orConditions []bson.M
 	for _, s := range services {
-		// be care for the order
-		srs = append(srs, bson.D{
-			{"product_name", s.Owner},
-			{"service_name", s.Name},
-		})
+		condition := bson.M{
+			"product_name": s.Owner,
+			"service_name": s.Name,
+		}
+		orConditions = append(orConditions, condition)
 	}
 
+	// Build optimized preMatch query that filters early
 	pre := bson.M{
 		"status": bson.M{"$ne": setting.ProductStatusDeleting},
+		"$or":    orConditions,
 	}
 	if serviceType != "" {
 		pre["type"] = serviceType
 	}
-	post := bson.M{
-		"_id": bson.M{"$in": srs},
-	}
 
-	return c.listMaxRevisions(pre, post)
+	// No postMatch needed - all filtering happens in first $match
+	return c.listMaxRevisions(pre, nil)
 }
 
 func (c *ServiceColl) ListMaxRevisionsByProduct(productName string) ([]*models.Service, error) {
@@ -673,7 +684,8 @@ func (c *ServiceColl) listMaxRevisions(preMatch, postMatch bson.M) ([]*models.Se
 			"$match": preMatch,
 		},
 		{
-			"$sort": bson.M{"revision": 1},
+			// Sort descending by revision to get the latest first
+			"$sort": bson.M{"revision": -1},
 		},
 		{
 			"$group": bson.M{
@@ -681,9 +693,10 @@ func (c *ServiceColl) listMaxRevisions(preMatch, postMatch bson.M) ([]*models.Se
 					{"product_name", "$product_name"},
 					{"service_name", "$service_name"},
 				},
-				"service_id": bson.M{"$last": "$_id"},
-				"visibility": bson.M{"$last": "$visibility"},
-				"build_name": bson.M{"$last": "$build_name"},
+				// Use $first with descending sort (more efficient than $last with ascending)
+				"service_id": bson.M{"$first": "$_id"},
+				"visibility": bson.M{"$first": "$visibility"},
+				"build_name": bson.M{"$first": "$build_name"},
 			},
 		},
 	}
