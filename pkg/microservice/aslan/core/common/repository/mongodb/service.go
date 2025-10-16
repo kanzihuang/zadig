@@ -132,16 +132,6 @@ func (c *ServiceColl) EnsureIndex(ctx context.Context) error {
 			},
 			Options: options.Index().SetUnique(false),
 		},
-		{
-			// Optimized index for listMaxRevisions queries
-			Keys: bson.D{
-				bson.E{Key: "status", Value: 1},
-				bson.E{Key: "product_name", Value: 1},
-				bson.E{Key: "service_name", Value: 1},
-				bson.E{Key: "revision", Value: -1},
-			},
-			Options: options.Index().SetUnique(false),
-		},
 	}
 
 	// 仅用于升级 release v1.3.1, 将在下一版本移除

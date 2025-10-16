@@ -79,6 +79,27 @@ func GetWorkflowArgs(productName, namespace string, log *zap.SugaredLogger) (*Cr
 		return resp, e.ErrListBuildModule.AddDesc(err.Error())
 	}
 
+	// Preload build templates to avoid N+1 queries in the loop
+	buildTemplateMap := make(map[string]*commonmodels.BuildTemplate)
+	templateIDs := sets.NewString()
+	for _, module := range allModules {
+		if module.TemplateID != "" {
+			templateIDs.Insert(module.TemplateID)
+		}
+	}
+	if templateIDs.Len() > 0 {
+		for _, templateID := range templateIDs.List() {
+			buildTemplate, err := commonrepo.NewBuildTemplateColl().Find(&commonrepo.BuildTemplateQueryOption{
+				ID: templateID,
+			})
+			if err != nil {
+				log.Warnf("Failed to find build template %s: %v", templateID, err)
+				continue
+			}
+			buildTemplateMap[templateID] = buildTemplate
+		}
+	}
+
 	targetMap, _ := commonservice.GetProductTargetMap(product)
 	projectTargets := getProjectTargets(product.ProductName)
 	targets := make([]*commonmodels.TargetArgs, 0)
@@ -97,7 +118,7 @@ func GetWorkflowArgs(productName, namespace string, log *zap.SugaredLogger) (*Cr
 			moBuild = &commonmodels.Build{}
 			target.HasBuild = false
 		}
-		err = fillBuildDetail(moBuild, containerArr[1], containerArr[2])
+		err = fillBuildDetailWithCache(moBuild, containerArr[1], containerArr[2], buildTemplateMap)
 		if err != nil {
 			return resp, e.ErrListBuildModule.AddErr(err)
 		}
@@ -367,6 +388,27 @@ func PresetWorkflowArgs(namespace, workflowName string, log *zap.SugaredLogger) 
 		return resp, e.ErrListTestModule.AddDesc(err.Error())
 	}
 
+	// Preload build templates to avoid N+1 queries in the loop
+	buildTemplateMap := make(map[string]*commonmodels.BuildTemplate)
+	templateIDs := sets.NewString()
+	for _, module := range allModules {
+		if module.TemplateID != "" {
+			templateIDs.Insert(module.TemplateID)
+		}
+	}
+	if templateIDs.Len() > 0 {
+		for _, templateID := range templateIDs.List() {
+			buildTemplate, err := commonrepo.NewBuildTemplateColl().Find(&commonrepo.BuildTemplateQueryOption{
+				ID: templateID,
+			})
+			if err != nil {
+				log.Warnf("Failed to find build template %s: %v", templateID, err)
+				continue
+			}
+			buildTemplateMap[templateID] = buildTemplate
+		}
+	}
+
 	// Preload productTmpl and services to avoid N+1 queries in the loop
 	productTmpl, err := template.NewProductColl().Find(workflow.ProductTmplName)
 	if err != nil {
@@ -421,7 +463,7 @@ func PresetWorkflowArgs(namespace, workflowName string, log *zap.SugaredLogger) 
 				target.HasBuild = false
 			}
 			target.BuildName = moBuild.Name
-			err = fillBuildDetail(moBuild, containerArr[1], containerArr[2])
+			err = fillBuildDetailWithCache(moBuild, containerArr[1], containerArr[2], buildTemplateMap)
 			if err != nil {
 				return resp, e.ErrListBuildModule.AddErr(err)
 			}
@@ -2011,18 +2053,9 @@ func CreateArtifactWorkflowTask(args *commonmodels.WorkflowTaskArgs, taskCreator
 	return resp, nil
 }
 
-// fillBuildDetail fill the contents for builds created from build templates
-func fillBuildDetail(moduleBuild *commonmodels.Build, serviceName, serviceModule string) error {
-	if moduleBuild.TemplateID == "" {
-		return nil
-	}
-	buildTemplate, err := commonrepo.NewBuildTemplateColl().Find(&commonrepo.BuildTemplateQueryOption{
-		ID: moduleBuild.TemplateID,
-	})
-	if err != nil {
-		return fmt.Errorf("failed to find build template with id: %s, err: %s", moduleBuild.TemplateID, err)
-	}
-
+// fillBuildDetailFromTemplate fills build details from a template into moduleBuild
+// This is a helper function to avoid code duplication between fillBuildDetail and fillBuildDetailWithCache
+func fillBuildDetailFromTemplate(moduleBuild *commonmodels.Build, buildTemplate *commonmodels.BuildTemplate, serviceName, serviceModule string) {
 	moduleBuild.Timeout = buildTemplate.Timeout
 	moduleBuild.PreBuild = buildTemplate.PreBuild
 	moduleBuild.JenkinsBuild = buildTemplate.JenkinsBuild
@@ -2046,6 +2079,36 @@ func fillBuildDetail(moduleBuild *commonmodels.Build, serviceName, serviceModule
 			break
 		}
 	}
+}
+
+// fillBuildDetailWithCache fill the contents for builds created from build templates using preloaded cache
+func fillBuildDetailWithCache(moduleBuild *commonmodels.Build, serviceName, serviceModule string, buildTemplateMap map[string]*commonmodels.BuildTemplate) error {
+	if moduleBuild.TemplateID == "" {
+		return nil
+	}
+	buildTemplate, ok := buildTemplateMap[moduleBuild.TemplateID]
+	if !ok {
+		// Fallback to database query if not in cache
+		return fillBuildDetail(moduleBuild, serviceName, serviceModule)
+	}
+
+	fillBuildDetailFromTemplate(moduleBuild, buildTemplate, serviceName, serviceModule)
+	return nil
+}
+
+// fillBuildDetail fill the contents for builds created from build templates
+func fillBuildDetail(moduleBuild *commonmodels.Build, serviceName, serviceModule string) error {
+	if moduleBuild.TemplateID == "" {
+		return nil
+	}
+	buildTemplate, err := commonrepo.NewBuildTemplateColl().Find(&commonrepo.BuildTemplateQueryOption{
+		ID: moduleBuild.TemplateID,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to find build template with id: %s, err: %s", moduleBuild.TemplateID, err)
+	}
+
+	fillBuildDetailFromTemplate(moduleBuild, buildTemplate, serviceName, serviceModule)
 	return nil
 }
 
