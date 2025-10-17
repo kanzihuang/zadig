@@ -100,6 +100,21 @@ func GetWorkflowArgs(productName, namespace string, log *zap.SugaredLogger) (*Cr
 		}
 	}
 
+	// Preload services to avoid N+1 queries when checking public services
+	productTmpl, err := template.NewProductColl().Find(product.ProductName)
+	if err != nil {
+		log.Errorf("[%s] ProductTmpl.Find error: %v", product.ProductName, err)
+		return resp, e.ErrFindProduct.AddDesc(err.Error())
+	}
+	projectServices, err := commonrepo.NewServiceColl().ListMaxRevisionsForServices(productTmpl.AllServiceInfos(), "")
+	servicesMap := make(map[string]*commonmodels.Service)
+	if err == nil {
+		for _, svc := range projectServices {
+			serviceKey := fmt.Sprintf("%s/%s", svc.ProductName, svc.ServiceName)
+			servicesMap[serviceKey] = svc
+		}
+	}
+
 	targetMap, _ := commonservice.GetProductTargetMap(product)
 	projectTargets := getProjectTargets(product.ProductName)
 	targets := make([]*commonmodels.TargetArgs, 0)
@@ -113,7 +128,7 @@ func GetWorkflowArgs(productName, namespace string, log *zap.SugaredLogger) (*Cr
 		}
 		target := &commonmodels.TargetArgs{Name: containerArr[2], ServiceName: containerArr[1], Deploy: targetMap[container], Build: &commonmodels.BuildArgs{}, HasBuild: true}
 
-		moBuild, _ := findModuleByTargetAndVersion(allModules, container)
+		moBuild, _ := findModuleByTargetAndVersion(allModules, container, servicesMap)
 		if moBuild == nil {
 			moBuild = &commonmodels.Build{}
 			target.HasBuild = false
@@ -230,13 +245,13 @@ func findModuleByContainer(productName, serviceModuleTarget string, buildStageMo
 				for _, container := range serviceTmpl.Containers {
 					targetStr := fmt.Sprintf("%s%s%s%s%s", serviceTmpl.ProductName, SplitSymbol, serviceTmpl.ServiceName, SplitSymbol, container.Name)
 					if serviceModuleTarget == targetStr {
-						buildName = findBuildNameByContainerName(container.Name, serviceTmpl)
+						buildName = findBuildNameByContainerName(container.Name, serviceTmpl, allModules)
 					}
 				}
 			} else if serviceTmpl.Type == setting.PMDeployType {
 				targetStr := fmt.Sprintf("%s%s%s%s%s", serviceTmpl.ProductName, SplitSymbol, serviceTmpl.ServiceName, SplitSymbol, serviceTmpl.ServiceName)
 				if serviceModuleTarget == targetStr {
-					buildName = findBuildNameByContainerName(serviceTmpl.ServiceName, serviceTmpl)
+					buildName = findBuildNameByContainerName(serviceTmpl.ServiceName, serviceTmpl, allModules)
 				}
 			}
 		}
@@ -257,38 +272,57 @@ func findModuleByContainer(productName, serviceModuleTarget string, buildStageMo
 	return nil, nil
 }
 
-func findBuildNameByContainerName(containerName string, serviceTmpl *commonmodels.Service) string {
-	opt := &commonrepo.BuildListOption{
-		ServiceName: serviceTmpl.ServiceName,
-		Targets:     []string{containerName},
+// findBuildNameByContainerName finds the build name using preloaded allModules to avoid database queries
+func findBuildNameByContainerName(containerName string, serviceTmpl *commonmodels.Service, allModules []*commonmodels.Build) string {
+	// Search in preloaded allModules instead of querying database
+	for _, module := range allModules {
+		// Check if this module has a target matching the service
+		for _, target := range module.Targets {
+			// Check if service name matches
+			if target.ServiceName != serviceTmpl.ServiceName {
+				continue
+			}
+			// Check if product name matches (for non-public services)
+			if serviceTmpl.Visibility != setting.PublicService && target.ProductName != serviceTmpl.ProductName {
+				continue
+			}
+			// Check if this target's service module matches the container
+			if target.ServiceModule == containerName {
+				return module.Name
+			}
+		}
 	}
-	if serviceTmpl.Visibility != setting.PublicService {
-		opt.ProductName = serviceTmpl.ProductName
-	}
-
-	buildModules, err := commonrepo.NewBuildColl().List(opt)
-	if err != nil || len(buildModules) == 0 {
-		return ""
-	}
-	buildName := buildModules[0].Name
-	return buildName
+	return ""
 }
 
-func findModuleByTargetAndVersion(allModules []*commonmodels.Build, serviceModuleTarget string) (*commonmodels.Build, *commonmodels.ServiceModuleTarget) {
+// findModuleByTargetAndVersion finds a build module by target string
+// If services map is provided, it uses the cache to avoid database queries
+func findModuleByTargetAndVersion(allModules []*commonmodels.Build, serviceModuleTarget string, servicesMap map[string]*commonmodels.Service) (*commonmodels.Build, *commonmodels.ServiceModuleTarget) {
 	containerArr := strings.Split(serviceModuleTarget, SplitSymbol)
 	if len(containerArr) != 3 {
 		return nil, nil
 	}
 
-	opt := &commonrepo.ServiceFindOption{
-		ServiceName:   containerArr[1],
-		ProductName:   containerArr[0],
-		ExcludeStatus: setting.ProductStatusDeleting,
+	// Check if service is public using preloaded services map if available
+	if servicesMap != nil {
+		// Create a key for the services map
+		serviceKey := fmt.Sprintf("%s/%s", containerArr[0], containerArr[1])
+		if serviceObj, ok := servicesMap[serviceKey]; ok && serviceObj.Visibility == setting.PublicService {
+			containerArr[0] = serviceObj.ProductName
+		}
+	} else {
+		// Fallback to database query if services map not provided
+		opt := &commonrepo.ServiceFindOption{
+			ServiceName:   containerArr[1],
+			ProductName:   containerArr[0],
+			ExcludeStatus: setting.ProductStatusDeleting,
+		}
+		serviceObj, _ := commonrepo.NewServiceColl().Find(opt)
+		if serviceObj != nil && serviceObj.Visibility == setting.PublicService {
+			containerArr[0] = serviceObj.ProductName
+		}
 	}
-	serviceObj, _ := commonrepo.NewServiceColl().Find(opt)
-	if serviceObj != nil && serviceObj.Visibility == setting.PublicService {
-		containerArr[0] = serviceObj.ProductName
-	}
+
 	for _, mo := range allModules {
 		for _, target := range mo.Targets {
 			targetStr := fmt.Sprintf("%s%s%s%s%s", target.ProductName, SplitSymbol, target.ServiceName, SplitSymbol, target.ServiceModule)
@@ -2151,8 +2185,29 @@ func BuildModuleToSubTasks(args *commonmodels.BuildModuleArgs, log *zap.SugaredL
 		return nil, e.ErrConvertSubTasks.AddErr(err)
 	}
 
+	// Preload build templates to avoid N+1 queries in the loop
+	buildTemplateMap := make(map[string]*commonmodels.BuildTemplate)
+	templateIDs := sets.NewString()
 	for _, module := range modules {
-		err = fillBuildDetail(module, args.ServiceName, args.Target)
+		if module.TemplateID != "" {
+			templateIDs.Insert(module.TemplateID)
+		}
+	}
+	if templateIDs.Len() > 0 {
+		for _, templateID := range templateIDs.List() {
+			buildTemplate, err := commonrepo.NewBuildTemplateColl().Find(&commonrepo.BuildTemplateQueryOption{
+				ID: templateID,
+			})
+			if err != nil {
+				log.Warnf("Failed to find build template %s: %v", templateID, err)
+				continue
+			}
+			buildTemplateMap[templateID] = buildTemplate
+		}
+	}
+
+	for _, module := range modules {
+		err = fillBuildDetailWithCache(module, args.ServiceName, args.Target, buildTemplateMap)
 		if err != nil {
 			return nil, e.ErrConvertSubTasks.AddErr(err)
 		}

@@ -147,6 +147,11 @@ func ListServiceWorkflows(productName, envName, serviceName, serviceType string,
 		return resp, e.ErrListBuildModule.AddDesc(err.Error())
 	}
 
+	// Create a simple services map with the current service for optimization
+	servicesMap := make(map[string]*commonmodels.Service)
+	serviceKey := fmt.Sprintf("%s/%s", service.ProductName, service.ServiceName)
+	servicesMap[serviceKey] = service
+
 	if serviceType == setting.K8SDeployType {
 		for _, container := range service.Containers {
 			// 不存在构建的服务组件直接跳过，不返回
@@ -156,7 +161,7 @@ func ListServiceWorkflows(productName, envName, serviceName, serviceType string,
 				ServiceModule: container.Name,
 			}
 			serviceModuleTarget := fmt.Sprintf("%s%s%s%s%s", service.ProductName, SplitSymbol, service.ServiceName, SplitSymbol, container.Name)
-			moBuild, _ := findModuleByTargetAndVersion(allModules, serviceModuleTarget)
+			moBuild, _ := findModuleByTargetAndVersion(allModules, serviceModuleTarget, servicesMap)
 			if moBuild == nil {
 				continue
 			}
@@ -169,7 +174,7 @@ func ListServiceWorkflows(productName, envName, serviceName, serviceType string,
 			ServiceModule: service.ServiceName,
 		}
 		serviceModuleTarget := fmt.Sprintf("%s%s%s%s%s", service.ProductName, SplitSymbol, service.ServiceName, SplitSymbol, service.ServiceName)
-		moBuild, _ := findModuleByTargetAndVersion(allModules, serviceModuleTarget)
+		moBuild, _ := findModuleByTargetAndVersion(allModules, serviceModuleTarget, servicesMap)
 		if moBuild != nil {
 			resp.Targets = append(resp.Targets, target)
 		}
