@@ -69,19 +69,8 @@ func ListContainers(productName string, log *zap.SugaredLogger) ([]*commonmodels
 	// 获取该项目使用到的所有服务组件
 	for _, service := range serviceTmpls {
 		if service.Type == setting.K8SDeployType || service.Type == setting.HelmDeployType {
-			// service中没有container信息，需要重新从数据库获取
-			opt := &commonrepo.ServiceFindOption{
-				ProductName:   service.ProductName,
-				ServiceName:   service.ServiceName,
-				Revision:      service.Revision,
-				ExcludeStatus: setting.ProductStatusDeleting,
-			}
-			serviceDetail, err := commonrepo.NewServiceColl().Find(opt)
-			if err != nil {
-				log.Errorf("ServiceTmpl.Find error: %v", err)
-				continue
-			}
-			for _, container := range serviceDetail.Containers {
+			// ListMaxRevisionsByProduct already returns complete Service objects with containers
+			for _, container := range service.Containers {
 				containerList = append(containerList, &commonmodels.ServiceModuleTarget{
 					ProductName:   service.ProductName,
 					ServiceName:   service.ServiceName,
