@@ -36,6 +36,7 @@ import (
 	"github.com/koderover/zadig/pkg/tool/httpclient"
 	"github.com/koderover/zadig/pkg/tool/log"
 	s3tool "github.com/koderover/zadig/pkg/tool/s3"
+	"github.com/koderover/zadig/pkg/types"
 	"github.com/koderover/zadig/pkg/util"
 )
 
@@ -70,53 +71,67 @@ func (r *Reaper) runIntallationScripts() error {
 
 		// 如果应用有配置下载路径
 		if install.Download != "" {
-			// 执行脚本之前检查缓存
-			var store *s3.S3
-			var err error
-			store = &s3.S3{
-				Ak:       r.Ctx.StorageAK,
-				Sk:       r.Ctx.StorageSK,
-				Endpoint: r.Ctx.StorageEndpoint,
-				Bucket:   r.Ctx.StorageBucket,
-				Insecure: true,
-				Provider: r.Ctx.StorageProvider,
-			}
-			store.Subfolder = fmt.Sprintf("%s/%s-v%s", config.ConstructCachePath, install.Name, install.Version)
-
 			filepath := strings.Split(install.Download, "/")
 			fileName := filepath[len(filepath)-1]
 			tmpPath = path.Join(os.TempDir(), fileName)
-			forcedPathStyle := true
-			if store.Provider == setting.ProviderSourceAli {
-				forcedPathStyle = false
-			}
-			s3client, err := s3tool.NewClient(store.Endpoint, store.Ak, store.Sk, store.Insecure, forcedPathStyle)
-			if err == nil {
-				objectKey := store.GetObjectPath(fileName)
-				err = s3client.Download(
-					store.Bucket,
-					objectKey,
-					tmpPath,
-				)
 
-				// 缓存不存在
-				if err != nil {
+			// 检查是否启用缓存且缓存介质为对象存储
+			// 只有当缓存启用时，才尝试从 S3 下载缓存
+			enableCache := r.Ctx.CacheEnable && r.Ctx.Cache.MediumType == types.ObjectMedium
+
+			if enableCache {
+				// 执行脚本之前检查缓存
+				var store *s3.S3
+				var err error
+				store = &s3.S3{
+					Ak:       r.Ctx.StorageAK,
+					Sk:       r.Ctx.StorageSK,
+					Endpoint: r.Ctx.StorageEndpoint,
+					Bucket:   r.Ctx.StorageBucket,
+					Insecure: true,
+					Provider: r.Ctx.StorageProvider,
+				}
+				store.Subfolder = fmt.Sprintf("%s/%s-v%s", config.ConstructCachePath, install.Name, install.Version)
+
+				forcedPathStyle := true
+				if store.Provider == setting.ProviderSourceAli {
+					forcedPathStyle = false
+				}
+				s3client, err := s3tool.NewClient(store.Endpoint, store.Ak, store.Sk, store.Insecure, forcedPathStyle)
+				if err == nil {
+					objectKey := store.GetObjectPath(fileName)
+					err = s3client.Download(
+						store.Bucket,
+						objectKey,
+						tmpPath,
+					)
+
+					// 缓存不存在
+					if err != nil {
+						err := httpclient.Download(install.Download, tmpPath)
+						if err != nil {
+							return err
+						}
+						s3client.Upload(
+							store.Bucket,
+							tmpPath,
+							objectKey,
+						)
+						log.Infof("Package loaded from url: %s", install.Download)
+					}
+				} else {
 					err := httpclient.Download(install.Download, tmpPath)
 					if err != nil {
 						return err
 					}
-					s3client.Upload(
-						store.Bucket,
-						tmpPath,
-						objectKey,
-					)
-					log.Infof("Package loaded from url: %s", install.Download)
 				}
 			} else {
+				// 缓存被禁用，直接从 URL 下载
 				err := httpclient.Download(install.Download, tmpPath)
 				if err != nil {
 					return err
 				}
+				log.Infof("Package loaded from url: %s (cache disabled)", install.Download)
 			}
 		}
 
