@@ -25,7 +25,9 @@ import (
 
 	commonmodels "github.com/koderover/zadig/pkg/microservice/aslan/core/common/repository/models"
 	"github.com/koderover/zadig/pkg/microservice/aslan/core/common/repository/mongodb"
+	"github.com/koderover/zadig/pkg/setting"
 	"github.com/koderover/zadig/pkg/shared/client/systemconfig"
+	"github.com/koderover/zadig/pkg/tool/git/gitlab"
 	"github.com/koderover/zadig/pkg/tool/log"
 	"github.com/koderover/zadig/pkg/types/step"
 )
@@ -65,11 +67,23 @@ func (s *gitCtl) PreRun(ctx context.Context) error {
 			return err
 		}
 		repo.Source = detail.Type
-		repo.OauthToken = detail.AccessToken
 		repo.Address = detail.Address
 		repo.Username = detail.Username
 		repo.Password = detail.Password
 		repo.EnableProxy = detail.EnableProxy
+
+		// For GitLab, refresh the OAuth token if expired
+		if detail.Type == setting.SourceFromGitlab {
+			refreshedToken, err := gitlab.UpdateGitlabToken(cID, detail.AccessToken)
+			if err != nil {
+				s.log.Warnf("failed to refresh GitLab token for codehost %d: %v, using existing token", cID, err)
+				repo.OauthToken = detail.AccessToken
+			} else {
+				repo.OauthToken = refreshedToken
+			}
+		} else {
+			repo.OauthToken = detail.AccessToken
+		}
 	}
 	proxies, _ := mongodb.NewProxyColl().List(&mongodb.ProxyArgs{})
 	if len(proxies) != 0 {
