@@ -325,13 +325,78 @@ func dockerPrune(clusterID, namespace, podName string, logger *zap.SugaredLogger
 		cleanInfo = errString
 	}
 
-	cleanInfoArr := strings.Split(cleanInfo, "\n\n")
-	if len(cleanInfoArr) >= 2 {
-		cleanInfo = cleanInfoArr[1]
-	}
-	cleanInfo = strings.Replace(cleanInfo, "\n", "", -1)
+	// Format the output to be human-readable
+	cleanInfo = formatDockerPruneOutput(cleanInfo)
 
 	return cleanInfo, err
+}
+
+// formatDockerPruneOutput formats the docker prune output to be concise and readable
+func formatDockerPruneOutput(output string) string {
+	if output == "" {
+		return "No output from docker prune"
+	}
+
+	lines := strings.Split(output, "\n")
+
+	// Try to find the "Total reclaimed space" line - this is what users care about most
+	var reclaimedSpace string
+	var deletedImages, deletedContainers, deletedVolumes int
+
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+
+		// Look for the total reclaimed space line
+		if strings.Contains(strings.ToLower(trimmed), "total reclaimed space") ||
+			strings.Contains(strings.ToLower(trimmed), "space reclaimed") {
+			reclaimedSpace = trimmed
+		}
+
+		// Count deleted items for summary
+		if strings.HasPrefix(trimmed, "deleted: sha256:") {
+			deletedImages++
+		} else if strings.HasPrefix(strings.ToLower(trimmed), "deleted container") {
+			deletedContainers++
+		} else if strings.HasPrefix(strings.ToLower(trimmed), "deleted volume") {
+			deletedVolumes++
+		}
+	}
+
+	// Build a concise summary
+	var summary []string
+
+	if deletedImages > 0 {
+		summary = append(summary, fmt.Sprintf("Deleted %d image(s)", deletedImages))
+	}
+	if deletedContainers > 0 {
+		summary = append(summary, fmt.Sprintf("%d container(s)", deletedContainers))
+	}
+	if deletedVolumes > 0 {
+		summary = append(summary, fmt.Sprintf("%d volume(s)", deletedVolumes))
+	}
+
+	// Combine summary and reclaimed space
+	var result string
+	if len(summary) > 0 {
+		result = strings.Join(summary, ", ")
+	}
+
+	if reclaimedSpace != "" {
+		if result != "" {
+			result += ". " + reclaimedSpace
+		} else {
+			result = reclaimedSpace
+		}
+	} else if result == "" {
+		// If we couldn't extract anything useful, truncate the raw output
+		if len(output) > 500 {
+			result = output[:500] + "... (output truncated)"
+		} else {
+			result = output
+		}
+	}
+
+	return result
 }
 
 func getDindPods(logger *zap.SugaredLogger) ([]types.DindPod, []string, error) {
