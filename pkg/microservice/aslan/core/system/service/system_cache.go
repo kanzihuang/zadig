@@ -312,6 +312,8 @@ func getDindPods(logger *zap.SugaredLogger) ([]types.DindPod, error) {
 	logger.Infof("Found %d active clusters for dind pod discovery", len(activeClusters))
 
 	dindPods := []types.DindPod{}
+	var failedClusters []string
+
 	for _, cluster := range activeClusters {
 		clusterID := cluster.ID.Hex()
 
@@ -327,7 +329,10 @@ func getDindPods(logger *zap.SugaredLogger) ([]types.DindPod, error) {
 
 		pods, err := getDindPodsInCluster(clusterID, ns, logger)
 		if err != nil {
-			return nil, fmt.Errorf("failed to get dind pods in ns %q of cluster %q: %s", ns, clusterID, err)
+			// Log the error but continue with other clusters
+			logger.Warnf("Failed to get dind pods in cluster %q (ID: %s): %s", cluster.Name, clusterID, err)
+			failedClusters = append(failedClusters, fmt.Sprintf("%s (%s)", cluster.Name, err.Error()))
+			continue
 		}
 
 		logger.Infof("Found %d dind pods in cluster %q namespace %q", len(pods), cluster.Name, ns)
@@ -339,6 +344,16 @@ func getDindPods(logger *zap.SugaredLogger) ([]types.DindPod, error) {
 				Pod:         pod,
 			})
 		}
+	}
+
+	// Only return error if we couldn't access ANY cluster
+	if len(dindPods) == 0 && len(failedClusters) > 0 {
+		return nil, fmt.Errorf("failed to access all clusters: %s", strings.Join(failedClusters, "; "))
+	}
+
+	if len(failedClusters) > 0 {
+		logger.Warnf("Successfully accessed %d clusters, but %d clusters failed: %s",
+			len(activeClusters)-len(failedClusters), len(failedClusters), strings.Join(failedClusters, "; "))
 	}
 
 	return dindPods, nil
