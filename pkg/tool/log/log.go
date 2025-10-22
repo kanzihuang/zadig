@@ -114,10 +114,11 @@ func getEncoder(cfg *Config, jsonFormat bool) zapcore.Encoder {
 
 func getLogWriter(filename string, maxSize, maxBackup, maxAge int) zapcore.WriteSyncer {
 	lumberJackLogger := &lumberjack.Logger{
-		Filename: filename,
-		// MaxSize:    maxSize,
-		// MaxBackups: maxBackup,
-		// MaxAge:     maxAge,
+		Filename:   filename,
+		MaxSize:    maxSize,   // megabytes
+		MaxBackups: maxBackup, // number of backups
+		MaxAge:     maxAge,    // days
+		Compress:   true,      // compress rotated files
 	}
 
 	return zapcore.AddSync(lumberJackLogger)
@@ -156,7 +157,9 @@ func getSimpleLogger() *zap.SugaredLogger {
 }
 
 func NewFileLogger(path string) *zap.Logger {
-	fileSyncer := getLogWriter(path, 0, 0, 0)
+	// Request logs can grow large, enable rotation:
+	// MaxSize: 100MB, MaxBackups: 100 files, MaxAge: 30 days
+	fileSyncer := getLogWriter(path, 100, 100, 30)
 	fileEncoder := getJSONEncoder(&Config{})
 	fileCore := zapcore.NewCore(fileEncoder, fileSyncer, zap.DebugLevel)
 	return zap.New(fileCore)

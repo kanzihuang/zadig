@@ -34,10 +34,26 @@ const timeISO8601 = "2006-01-02T15:04:05.000Z0700"
 
 var sensitiveHeaders = sets.NewString("authorization", "cookie", "token", "session")
 
+// Skip logging for these paths to reduce log volume
+var skipLogPaths = sets.NewString(
+	"/api/health",
+	"/health",
+	"/healthz",
+	"/api/ping",
+	"/ping",
+)
+
 func RequestLog(logger *zap.Logger) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		start := time.Now()
 		path := c.Request.URL.Path
+
+		// Skip logging for health check and monitoring endpoints
+		if skipLogPaths.Has(path) {
+			c.Next()
+			return
+		}
+
 		raw := c.Request.URL.RawQuery
 		if raw != "" {
 			path = path + "?" + raw
