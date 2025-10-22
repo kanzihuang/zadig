@@ -117,7 +117,7 @@ func CleanImageCache(logger *zap.SugaredLogger) error {
 		}
 	}
 
-	dindPods, err := getDindPods(logger)
+	dindPods, failedClusters, err := getDindPods(logger)
 	if err != nil {
 		logger.Errorf("Failed to list dind pods: %s", err)
 		errInfo := &commonmodels.DindCleanInfo{
@@ -134,6 +134,9 @@ func CleanImageCache(logger *zap.SugaredLogger) error {
 		})
 	}
 	logger.Infof("Total dind Pods found: %d", len(dindPods))
+	if len(failedClusters) > 0 {
+		logger.Warnf("Some clusters were inaccessible and will be skipped: %s", strings.Join(failedClusters, "; "))
+	}
 
 	// Note: Since the total number of dind instances of Zadig users will not exceed `50` within one or two years
 	// (at this time, the resource amount may be `200C400GiB`, and the resource cost is too high), concurrency can be
@@ -141,16 +144,29 @@ func CleanImageCache(logger *zap.SugaredLogger) error {
 	timeout, cancel := context.WithTimeout(context.Background(), 20*time.Minute)
 	defer cancel()
 	res := make(chan *commonmodels.DindClean)
-	go func(ch chan *commonmodels.DindClean) {
+	go func(ch chan *commonmodels.DindClean, failedClustersInfo []string) {
 		var (
-			status         = CleanStatusSuccess
-			dindInfosMutex sync.Mutex
-			readyPodsCount = 0
-			notReadyPods   []string
+			status            = CleanStatusSuccess
+			dindInfosMutex    sync.Mutex
+			readyPodsCount    = 0
+			successPodsCount  = 0
+			notReadyPods      []string
+			hasCleanupAttempt = false
 		)
 
-		dindInfos := make([]*commonmodels.DindCleanInfo, 0, len(dindPods))
+		dindInfos := make([]*commonmodels.DindCleanInfo, 0, len(dindPods)+len(failedClustersInfo))
 		var wg sync.WaitGroup
+
+		// Add failed clusters as warning entries in the cleanup results
+		for _, failedCluster := range failedClustersInfo {
+			dindInfos = append(dindInfos, &commonmodels.DindCleanInfo{
+				PodName:      fmt.Sprintf("cluster-error: %s", failedCluster),
+				StartTime:    time.Now().Unix(),
+				EndTime:      time.Now().Unix(),
+				CleanInfo:    "Cluster was inaccessible and skipped",
+				ErrorMessage: fmt.Sprintf("Failed to access cluster: %s", failedCluster),
+			})
+		}
 
 		// Check and log pod readiness status
 		for _, dindPod := range dindPods {
@@ -160,6 +176,7 @@ func CleanImageCache(logger *zap.SugaredLogger) error {
 				continue
 			}
 			readyPodsCount++
+			hasCleanupAttempt = true
 
 			logger.Infof("Begin to clean up cache of dind %q in ns %q of cluster %q.", dindPod.Pod.Name, dindPod.Pod.Namespace, dindPod.ClusterID)
 			wg.Add(1)
@@ -173,6 +190,11 @@ func CleanImageCache(logger *zap.SugaredLogger) error {
 				if err != nil {
 					logger.Warnf("Failed to clean up cache of dind %q in ns %q of cluster %q: %s", podInfo.Pod.Name, podInfo.Pod.Namespace, podInfo.ClusterID, err)
 					dindInfo.ErrorMessage = err.Error()
+				} else {
+					// Track successful cleanups
+					dindInfosMutex.Lock()
+					successPodsCount++
+					dindInfosMutex.Unlock()
 				}
 				logger.Infof("Finish cleaning up cache of dind %q in ns %q of cluster %q.", podInfo.Pod.Name, podInfo.Pod.Namespace, podInfo.ClusterID)
 
@@ -188,12 +210,19 @@ func CleanImageCache(logger *zap.SugaredLogger) error {
 
 		wg.Wait()
 
-		// If no ready pods were found, record this as an error
-		if readyPodsCount == 0 {
+		// Determine final status based on cleanup results
+		// Success if at least one pod was successfully cleaned, even if some clusters failed
+		if !hasCleanupAttempt {
+			// No pods were available for cleanup (all clusters failed or no ready pods)
 			status = CleanStatusFailed
-			errMsg := fmt.Sprintf("No ready dind pods found. Total pods: %d, Not ready: %d", len(dindPods), len(notReadyPods))
-			if len(notReadyPods) > 0 {
-				errMsg += fmt.Sprintf(". Not ready pods: %s", strings.Join(notReadyPods, ", "))
+			errMsg := "No dind pods available for cleanup"
+			if len(dindPods) == 0 {
+				errMsg = fmt.Sprintf("No dind pods found in accessible clusters (%d clusters failed)", len(failedClustersInfo))
+			} else if readyPodsCount == 0 {
+				errMsg = fmt.Sprintf("No ready dind pods found. Total pods: %d, Not ready: %d", len(dindPods), len(notReadyPods))
+				if len(notReadyPods) > 0 {
+					errMsg += fmt.Sprintf(". Not ready pods: %s", strings.Join(notReadyPods, ", "))
+				}
 			}
 			logger.Errorf(errMsg)
 
@@ -203,15 +232,17 @@ func CleanImageCache(logger *zap.SugaredLogger) error {
 				EndTime:      time.Now().Unix(),
 				ErrorMessage: errMsg,
 			})
-		} else {
-			// Check for any errors in the cleaning process
-			for _, dindInfo := range dindInfos {
-				if dindInfo.ErrorMessage != "" {
-					status = CleanStatusFailed
-					break
-				}
+		} else if successPodsCount > 0 {
+			// At least one pod was successfully cleaned - mark as success
+			status = CleanStatusSuccess
+			logger.Infof("Successfully cleaned cache for %d/%d dind pods", successPodsCount, readyPodsCount)
+			if successPodsCount < readyPodsCount {
+				logger.Warnf("%d pod(s) failed to clean", readyPodsCount-successPodsCount)
 			}
-			logger.Infof("Successfully cleaned cache for %d ready dind pods", readyPodsCount)
+		} else {
+			// All cleanup attempts failed
+			status = CleanStatusFailed
+			logger.Errorf("All %d cleanup attempts failed", readyPodsCount)
 		}
 
 		res <- &commonmodels.DindClean{
@@ -221,7 +252,7 @@ func CleanImageCache(logger *zap.SugaredLogger) error {
 			CronEnabled:    dindCleans[0].CronEnabled,
 		}
 
-	}(res)
+	}(res, failedClusters)
 
 	select {
 	case <-timeout.Done():
@@ -303,10 +334,10 @@ func dockerPrune(clusterID, namespace, podName string, logger *zap.SugaredLogger
 	return cleanInfo, err
 }
 
-func getDindPods(logger *zap.SugaredLogger) ([]types.DindPod, error) {
+func getDindPods(logger *zap.SugaredLogger) ([]types.DindPod, []string, error) {
 	activeClusters, err := commonrepo.NewK8SClusterColl().FindActiveClusters()
 	if err != nil {
-		return nil, fmt.Errorf("failed to get active cluster: %s", err)
+		return nil, nil, fmt.Errorf("failed to get active cluster: %s", err)
 	}
 
 	logger.Infof("Found %d active clusters for dind pod discovery", len(activeClusters))
@@ -348,7 +379,7 @@ func getDindPods(logger *zap.SugaredLogger) ([]types.DindPod, error) {
 
 	// Only return error if we couldn't access ANY cluster
 	if len(dindPods) == 0 && len(failedClusters) > 0 {
-		return nil, fmt.Errorf("failed to access all clusters: %s", strings.Join(failedClusters, "; "))
+		return nil, failedClusters, fmt.Errorf("failed to access all clusters: %s", strings.Join(failedClusters, "; "))
 	}
 
 	if len(failedClusters) > 0 {
@@ -356,7 +387,7 @@ func getDindPods(logger *zap.SugaredLogger) ([]types.DindPod, error) {
 			len(activeClusters)-len(failedClusters), len(failedClusters), strings.Join(failedClusters, "; "))
 	}
 
-	return dindPods, nil
+	return dindPods, failedClusters, nil
 }
 
 func getDindPodsInCluster(clusterID, ns string, logger *zap.SugaredLogger) ([]*corev1.Pod, error) {
