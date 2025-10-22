@@ -49,7 +49,7 @@ const (
 	CleanStatusFailed   = "failed"
 )
 
-//SetCron set the docker clean cron
+// SetCron set the docker clean cron
 func SetCron(cron string, cronEnabled bool, logger *zap.SugaredLogger) error {
 	dindCleans, err := commonrepo.NewDindCleanColl().List()
 	if err != nil {
@@ -117,17 +117,23 @@ func CleanImageCache(logger *zap.SugaredLogger) error {
 		}
 	}
 
-	dindPods, err := getDindPods()
+	dindPods, err := getDindPods(logger)
 	if err != nil {
 		logger.Errorf("Failed to list dind pods: %s", err)
+		errInfo := &commonmodels.DindCleanInfo{
+			PodName:      "system",
+			StartTime:    time.Now().Unix(),
+			EndTime:      time.Now().Unix(),
+			ErrorMessage: fmt.Sprintf("Failed to list dind pods: %s", err),
+		}
 		return commonrepo.NewDindCleanColl().Upsert(&commonmodels.DindClean{
 			Status:         CleanStatusFailed,
-			DindCleanInfos: []*commonmodels.DindCleanInfo{},
+			DindCleanInfos: []*commonmodels.DindCleanInfo{errInfo},
 			Cron:           dindCleans[0].Cron,
 			CronEnabled:    dindCleans[0].CronEnabled,
 		})
 	}
-	logger.Infof("Total dind Pods to be cleaned up: %d", len(dindPods))
+	logger.Infof("Total dind Pods found: %d", len(dindPods))
 
 	// Note: Since the total number of dind instances of Zadig users will not exceed `50` within one or two years
 	// (at this time, the resource amount may be `200C400GiB`, and the resource cost is too high), concurrency can be
@@ -137,15 +143,23 @@ func CleanImageCache(logger *zap.SugaredLogger) error {
 	res := make(chan *commonmodels.DindClean)
 	go func(ch chan *commonmodels.DindClean) {
 		var (
-			status = CleanStatusSuccess
+			status         = CleanStatusSuccess
+			dindInfosMutex sync.Mutex
+			readyPodsCount = 0
+			notReadyPods   []string
 		)
 
 		dindInfos := make([]*commonmodels.DindCleanInfo, 0, len(dindPods))
 		var wg sync.WaitGroup
+
+		// Check and log pod readiness status
 		for _, dindPod := range dindPods {
 			if !wrapper.Pod(dindPod.Pod).Ready() {
+				notReadyPods = append(notReadyPods, fmt.Sprintf("%s:%s (status: %s)", dindPod.ClusterName, dindPod.Pod.Name, dindPod.Pod.Status.Phase))
+				logger.Warnf("Dind pod %q in ns %q of cluster %q is not ready (phase: %s), skipping", dindPod.Pod.Name, dindPod.Pod.Namespace, dindPod.ClusterID, dindPod.Pod.Status.Phase)
 				continue
 			}
+			readyPodsCount++
 
 			logger.Infof("Begin to clean up cache of dind %q in ns %q of cluster %q.", dindPod.Pod.Name, dindPod.Pod.Namespace, dindPod.ClusterID)
 			wg.Add(1)
@@ -164,17 +178,42 @@ func CleanImageCache(logger *zap.SugaredLogger) error {
 
 				dindInfo.EndTime = time.Now().Unix()
 				dindInfo.CleanInfo = output
+
+				// Thread-safe append
+				dindInfosMutex.Lock()
 				dindInfos = append(dindInfos, dindInfo)
+				dindInfosMutex.Unlock()
 			}(dindPod)
 		}
 
 		wg.Wait()
-		for _, dindInfo := range dindInfos {
-			if dindInfo.ErrorMessage != "" {
-				status = CleanStatusFailed
-				break
+
+		// If no ready pods were found, record this as an error
+		if readyPodsCount == 0 {
+			status = CleanStatusFailed
+			errMsg := fmt.Sprintf("No ready dind pods found. Total pods: %d, Not ready: %d", len(dindPods), len(notReadyPods))
+			if len(notReadyPods) > 0 {
+				errMsg += fmt.Sprintf(". Not ready pods: %s", strings.Join(notReadyPods, ", "))
 			}
+			logger.Errorf(errMsg)
+
+			dindInfos = append(dindInfos, &commonmodels.DindCleanInfo{
+				PodName:      "system",
+				StartTime:    time.Now().Unix(),
+				EndTime:      time.Now().Unix(),
+				ErrorMessage: errMsg,
+			})
+		} else {
+			// Check for any errors in the cleaning process
+			for _, dindInfo := range dindInfos {
+				if dindInfo.ErrorMessage != "" {
+					status = CleanStatusFailed
+					break
+				}
+			}
+			logger.Infof("Successfully cleaned cache for %d ready dind pods", readyPodsCount)
 		}
+
 		res <- &commonmodels.DindClean{
 			Status:         status,
 			DindCleanInfos: dindInfos,
@@ -186,9 +225,16 @@ func CleanImageCache(logger *zap.SugaredLogger) error {
 
 	select {
 	case <-timeout.Done():
+		logger.Errorf("Dind cache cleanup operation timed out after 20 minutes")
+		timeoutErrInfo := &commonmodels.DindCleanInfo{
+			PodName:      "system",
+			StartTime:    time.Now().Unix(),
+			EndTime:      time.Now().Unix(),
+			ErrorMessage: "Cache cleanup operation timed out after 20 minutes",
+		}
 		commonrepo.NewDindCleanColl().Upsert(&commonmodels.DindClean{
 			Status:         CleanStatusFailed,
-			DindCleanInfos: []*commonmodels.DindCleanInfo{},
+			DindCleanInfos: []*commonmodels.DindCleanInfo{timeoutErrInfo},
 			Cron:           dindCleans[0].Cron,
 			CronEnabled:    dindCleans[0].CronEnabled,
 		})
@@ -257,11 +303,13 @@ func dockerPrune(clusterID, namespace, podName string, logger *zap.SugaredLogger
 	return cleanInfo, err
 }
 
-func getDindPods() ([]types.DindPod, error) {
+func getDindPods(logger *zap.SugaredLogger) ([]types.DindPod, error) {
 	activeClusters, err := commonrepo.NewK8SClusterColl().FindActiveClusters()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get active cluster: %s", err)
 	}
+
+	logger.Infof("Found %d active clusters for dind pod discovery", len(activeClusters))
 
 	dindPods := []types.DindPod{}
 	for _, cluster := range activeClusters {
@@ -275,10 +323,14 @@ func getDindPods() ([]types.DindPod, error) {
 			ns = setting.AttachedClusterNamespace
 		}
 
-		pods, err := getDindPodsInCluster(clusterID, ns)
+		logger.Infof("Searching for dind pods in cluster %q (ID: %s) namespace %q", cluster.Name, clusterID, ns)
+
+		pods, err := getDindPodsInCluster(clusterID, ns, logger)
 		if err != nil {
 			return nil, fmt.Errorf("failed to get dind pods in ns %q of cluster %q: %s", ns, clusterID, err)
 		}
+
+		logger.Infof("Found %d dind pods in cluster %q namespace %q", len(pods), cluster.Name, ns)
 
 		for _, pod := range pods {
 			dindPods = append(dindPods, types.DindPod{
@@ -292,12 +344,23 @@ func getDindPods() ([]types.DindPod, error) {
 	return dindPods, nil
 }
 
-func getDindPodsInCluster(clusterID, ns string) ([]*corev1.Pod, error) {
+func getDindPodsInCluster(clusterID, ns string, logger *zap.SugaredLogger) ([]*corev1.Pod, error) {
 	kclient, err := kubeclient.GetKubeClient(config.HubServerAddress(), clusterID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get kube client for cluster %q: %s", clusterID, err)
 	}
 
 	dindSelector := labels.Set{setting.ComponentLabel: "dind"}.AsSelector()
-	return getter.ListPods(ns, dindSelector, kclient)
+	logger.Infof("Looking for pods with label selector: %s=%s in namespace %q", setting.ComponentLabel, "dind", ns)
+
+	pods, err := getter.ListPods(ns, dindSelector, kclient)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(pods) == 0 {
+		logger.Warnf("No dind pods found with label %s=dind in namespace %q of cluster %q", setting.ComponentLabel, ns, clusterID)
+	}
+
+	return pods, nil
 }
