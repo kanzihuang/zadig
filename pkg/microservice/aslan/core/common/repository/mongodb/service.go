@@ -153,6 +153,11 @@ type serviceID struct {
 }
 
 func (c *ServiceColl) ListMaxRevisionsForServices(services []*templatemodels.ServiceInfo, serviceType string) ([]*models.Service, error) {
+	// If no services are provided, return empty result
+	if len(services) == 0 {
+		return nil, nil
+	}
+
 	// Build $or conditions for efficient filtering in first $match stage
 	var orConditions []bson.M
 	for _, s := range services {
