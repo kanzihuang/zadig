@@ -170,18 +170,24 @@ func ListWorkflowV4(projectName, userID string, names, v4Names []string, ignoreW
 		}
 	}
 
-	workflowList := []string{}
-	for _, wV4 := range workflowV4List {
-		workflowList = append(workflowList, wV4.Name)
-	}
 	resp = append(resp, workflow...)
 	workflowCMMap, err := collaboration.GetWorkflowCMMap([]string{projectName}, logger)
 	if err != nil {
 		return nil, err
 	}
-	tasks, _, err := commonrepo.NewworkflowTaskv4Coll().List(&commonrepo.ListWorkflowTaskV4Option{WorkflowNames: workflowList})
+
+	// Collect all workflow names for bulk query
+	workflowNames := make([]string, 0, len(workflowV4List))
+	for _, wf := range workflowV4List {
+		workflowNames = append(workflowNames, wf.Name)
+	}
+
+	// Get recent task info for all workflows in a single batch query (3 aggregation queries instead of 3*N queries)
+	recentTaskInfoMap, err := commonrepo.NewworkflowTaskv4Coll().GetBulkRecentTaskInfo(workflowNames)
 	if err != nil {
-		return resp, err
+		logger.Warnf("Failed to get bulk recent task info: %s", err)
+		// Continue with empty map if there's an error
+		recentTaskInfoMap = make(map[string]*commonrepo.RecentTaskInfo)
 	}
 
 	for _, workflowModel := range workflowV4List {
@@ -207,52 +213,35 @@ func ListWorkflowV4(projectName, userID string, names, v4Names []string, ignoreW
 			BaseRefs:      baseRefs,
 			BaseName:      workflowModel.BaseName,
 		}
-		getRecentTaskV4Info(workflow, tasks)
+
+		// Set recent task info from the bulk query result
+		if taskInfo, ok := recentTaskInfoMap[workflowModel.Name]; ok {
+			if taskInfo.RecentTask != nil && taskInfo.RecentTask.TaskID > 0 {
+				workflow.RecentTask = &TaskInfo{
+					TaskID:       taskInfo.RecentTask.TaskID,
+					PipelineName: taskInfo.RecentTask.WorkflowName,
+					Status:       string(taskInfo.RecentTask.Status),
+				}
+			}
+			if taskInfo.RecentSuccess != nil && taskInfo.RecentSuccess.TaskID > 0 {
+				workflow.RecentSuccessfulTask = &TaskInfo{
+					TaskID:       taskInfo.RecentSuccess.TaskID,
+					PipelineName: taskInfo.RecentSuccess.WorkflowName,
+					Status:       string(taskInfo.RecentSuccess.Status),
+				}
+			}
+			if taskInfo.RecentFailed != nil && taskInfo.RecentFailed.TaskID > 0 {
+				workflow.RecentFailedTask = &TaskInfo{
+					TaskID:       taskInfo.RecentFailed.TaskID,
+					PipelineName: taskInfo.RecentFailed.WorkflowName,
+					Status:       string(taskInfo.RecentFailed.Status),
+				}
+			}
+		}
 
 		resp = append(resp, workflow)
 	}
 	return resp, nil
-}
-
-func getRecentTaskV4Info(workflow *Workflow, tasks []*commonmodels.WorkflowTask) {
-	recentTask := &commonmodels.WorkflowTask{}
-	recentFailedTask := &commonmodels.WorkflowTask{}
-	recentSucceedTask := &commonmodels.WorkflowTask{}
-	for _, task := range tasks {
-		if task.WorkflowName != workflow.Name {
-			continue
-		}
-		if task.TaskID > recentTask.TaskID {
-			recentTask = task
-		}
-		if task.Status == config.StatusPassed && task.TaskID > recentSucceedTask.TaskID {
-			recentSucceedTask = task
-		}
-		if task.Status == config.StatusFailed && task.TaskID > recentFailedTask.TaskID {
-			recentFailedTask = task
-		}
-	}
-	if recentTask.TaskID > 0 {
-		workflow.RecentTask = &TaskInfo{
-			TaskID:       recentTask.TaskID,
-			PipelineName: recentTask.WorkflowName,
-			Status:       string(recentTask.Status),
-		}
-	}
-	if recentSucceedTask.TaskID > 0 {
-		workflow.RecentSuccessfulTask = &TaskInfo{
-			TaskID:       recentSucceedTask.TaskID,
-			PipelineName: recentSucceedTask.WorkflowName,
-			Status:       string(recentSucceedTask.Status),
-		}
-	}
-	if recentFailedTask.TaskID > 0 {
-		workflow.RecentFailedTask = &TaskInfo{
-			TaskID:       recentFailedTask.TaskID,
-			PipelineName: recentFailedTask.WorkflowName,
-			Status:       string(recentFailedTask.Status),
-		}
-	}
 }
 
 func ensureWorkflowV4Resp(encryptedKey string, workflow *commonmodels.WorkflowV4, logger *zap.SugaredLogger) error {

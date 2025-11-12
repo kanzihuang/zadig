@@ -254,3 +254,136 @@ func (c *WorkflowTaskv4Coll) ArchiveHistoryWorkflowTask(workflowName string, rem
 
 	return err
 }
+
+// RecentTaskInfo holds recent task information for a workflow
+type RecentTaskInfo struct {
+	WorkflowName  string
+	RecentTask    *models.WorkflowTask
+	RecentSuccess *models.WorkflowTask
+	RecentFailed  *models.WorkflowTask
+}
+
+// GetBulkRecentTaskInfo retrieves recent task info for multiple workflows in a single aggregation query
+// This is much more efficient than querying each workflow separately
+func (c *WorkflowTaskv4Coll) GetBulkRecentTaskInfo(workflowNames []string) (map[string]*RecentTaskInfo, error) {
+	if len(workflowNames) == 0 {
+		return make(map[string]*RecentTaskInfo), nil
+	}
+
+	result := make(map[string]*RecentTaskInfo)
+	for _, name := range workflowNames {
+		result[name] = &RecentTaskInfo{WorkflowName: name}
+	}
+
+	// Use aggregation pipeline to get recent tasks efficiently
+	// Pipeline: match -> sort -> group (get first of each workflow)
+	pipeline := mongo.Pipeline{
+		// Stage 1: Match non-deleted, non-archived tasks for specified workflows
+		{{Key: "$match", Value: bson.M{
+			"workflow_name": bson.M{"$in": workflowNames},
+			"is_deleted":    false,
+			"is_archived":   false,
+		}}},
+		// Stage 2: Sort by workflow_name and task_id descending
+		{{Key: "$sort", Value: bson.D{
+			{Key: "workflow_name", Value: 1},
+			{Key: "task_id", Value: -1},
+		}}},
+		// Stage 3: Group by workflow_name and get first (most recent) task
+		{{Key: "$group", Value: bson.M{
+			"_id":        "$workflow_name",
+			"recentTask": bson.M{"$first": "$$ROOT"},
+		}}},
+	}
+
+	cursor, err := c.Aggregate(context.TODO(), pipeline)
+	if err != nil {
+		return nil, err
+	}
+	defer cursor.Close(context.TODO())
+
+	type groupResult struct {
+		ID         string               `bson:"_id"`
+		RecentTask *models.WorkflowTask `bson:"recentTask"`
+	}
+
+	for cursor.Next(context.TODO()) {
+		var gr groupResult
+		if err := cursor.Decode(&gr); err != nil {
+			continue
+		}
+		if info, ok := result[gr.ID]; ok {
+			info.RecentTask = gr.RecentTask
+		}
+	}
+
+	// Get recent successful tasks
+	successPipeline := mongo.Pipeline{
+		{{Key: "$match", Value: bson.M{
+			"workflow_name": bson.M{"$in": workflowNames},
+			"is_deleted":    false,
+			"is_archived":   false,
+			"status":        config.StatusPassed,
+		}}},
+		{{Key: "$sort", Value: bson.D{
+			{Key: "workflow_name", Value: 1},
+			{Key: "task_id", Value: -1},
+		}}},
+		{{Key: "$group", Value: bson.M{
+			"_id":        "$workflow_name",
+			"recentTask": bson.M{"$first": "$$ROOT"},
+		}}},
+	}
+
+	cursor, err = c.Aggregate(context.TODO(), successPipeline)
+	if err != nil {
+		return nil, err
+	}
+	defer cursor.Close(context.TODO())
+
+	for cursor.Next(context.TODO()) {
+		var gr groupResult
+		if err := cursor.Decode(&gr); err != nil {
+			continue
+		}
+		if info, ok := result[gr.ID]; ok {
+			info.RecentSuccess = gr.RecentTask
+		}
+	}
+
+	// Get recent failed tasks
+	failedPipeline := mongo.Pipeline{
+		{{Key: "$match", Value: bson.M{
+			"workflow_name": bson.M{"$in": workflowNames},
+			"is_deleted":    false,
+			"is_archived":   false,
+			"status":        config.StatusFailed,
+		}}},
+		{{Key: "$sort", Value: bson.D{
+			{Key: "workflow_name", Value: 1},
+			{Key: "task_id", Value: -1},
+		}}},
+		{{Key: "$group", Value: bson.M{
+			"_id":        "$workflow_name",
+			"recentTask": bson.M{"$first": "$$ROOT"},
+		}}},
+	}
+
+	cursor, err = c.Aggregate(context.TODO(), failedPipeline)
+	if err != nil {
+		return nil, err
+	}
+	defer cursor.Close(context.TODO())
+
+	for cursor.Next(context.TODO()) {
+		var gr groupResult
+		if err := cursor.Decode(&gr); err != nil {
+			continue
+		}
+		if info, ok := result[gr.ID]; ok {
+			info.RecentFailed = gr.RecentTask
+		}
+	}
+
+	return result, nil
+}
