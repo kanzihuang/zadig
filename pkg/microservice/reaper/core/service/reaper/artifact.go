@@ -144,6 +144,14 @@ func s3FileUpload(store *s3.S3, sourceFile, objectKey string) error {
 		return err
 	}
 
+	// Quick connectivity check before upload to fail fast if S3/Minio is unreachable
+	log.Infof("Checking S3/Minio connectivity before uploading artifact...")
+	if err = s3client.QuickValidateBucket(store.Bucket); err != nil {
+		log.Errorf("S3 connectivity check failed: %v", err)
+		return err
+	}
+	log.Infof("S3/Minio connectivity check passed.")
+
 	if err = s3client.Upload(store.Bucket, sourceFile, objectKey); err != nil {
 		log.Errorf("Archive s3 upload err:%s", err)
 		return err

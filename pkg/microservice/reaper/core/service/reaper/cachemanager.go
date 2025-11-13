@@ -129,6 +129,15 @@ func (gcm *TarCacheManager) Archive(source, dest string) error {
 			log.Errorf("Archive s3 create s3 client error: %+v", err)
 			return err
 		}
+
+		// Quick connectivity check before upload to fail fast if S3/Minio is unreachable
+		log.Infof("Checking S3/Minio connectivity before uploading cache...")
+		if err = s3client.QuickValidateBucket(store.Bucket); err != nil {
+			log.Errorf("Archive s3 connectivity check failed: %v", err)
+			return err
+		}
+		log.Infof("S3/Minio connectivity check passed.")
+
 		objectKey := store.GetObjectPath(meta.FileName)
 		if err = s3client.Upload(store.Bucket, temp.Name(), objectKey); err != nil {
 			log.Errorf("Archive s3 upload err:%v", err)
@@ -149,6 +158,15 @@ func (gcm *TarCacheManager) Unarchive(source, dest string) error {
 		if err != nil {
 			return err
 		}
+
+		// Quick connectivity check before download to fail fast if S3/Minio is unreachable
+		log.Infof("Checking S3/Minio connectivity before downloading cache...")
+		if err = s3client.QuickValidateBucket(store.Bucket); err != nil {
+			log.Errorf("Unarchive s3 connectivity check failed: %v", err)
+			return err
+		}
+		log.Infof("S3/Minio connectivity check passed.")
+
 		files, _ := s3client.ListFiles(store.Bucket, store.GetObjectPath(meta.FileName), false)
 		if len(files) > 0 {
 			if sourceFilename, err := util.GenerateTmpFile(); err == nil {

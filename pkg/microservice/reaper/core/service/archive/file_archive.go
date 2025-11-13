@@ -236,6 +236,15 @@ func (c *WorkspaceAchiever) Achieve(target string) ([]string, error) {
 			log.Errorf("Archive s3 create s3 client error: %+v", err)
 			return nil, err
 		}
+
+		// Quick connectivity check before upload to fail fast if S3/Minio is unreachable
+		log.Infof("Checking S3/Minio connectivity before uploading workspace cache...")
+		if err = s3client.QuickValidateBucket(store.Bucket); err != nil {
+			log.Errorf("Archive s3 connectivity check failed: %v", err)
+			return nil, err
+		}
+		log.Infof("S3/Minio connectivity check passed.")
+
 		objectKey := store.GetObjectPath(fmt.Sprintf("%s/%s/%s/%s", c.PipelineName, c.ServiceName, "cache", meta.FileName))
 		if err = s3client.Upload(store.Bucket, temp.Name(), objectKey); err != nil {
 			log.Errorf("Archive s3 upload err:%v", err)

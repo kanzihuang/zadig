@@ -100,13 +100,21 @@ func (r *Reaper) runIntallationScripts() error {
 				s3client, err := s3tool.NewClient(store.Endpoint, store.Ak, store.Sk, store.Insecure, forcedPathStyle)
 				if err == nil {
 					objectKey := store.GetObjectPath(fileName)
-					err = s3client.Download(
-						store.Bucket,
-						objectKey,
-						tmpPath,
-					)
+					// Quick connectivity check before download to fail fast if S3/Minio is unreachable
+					log.Infof("Checking S3/Minio connectivity before downloading dependency cache...")
+					if err = s3client.QuickValidateBucket(store.Bucket); err != nil {
+						log.Warnf("S3 connectivity check failed: %v, will try downloading from URL instead", err)
+						// Fall through to download from URL
+					} else {
+						log.Infof("S3/Minio connectivity check passed.")
+						err = s3client.Download(
+							store.Bucket,
+							objectKey,
+							tmpPath,
+						)
+					}
 
-					// 缓存不存在
+					// 缓存不存在或连接失败
 					if err != nil {
 						err := httpclient.Download(install.Download, tmpPath)
 						if err != nil {
@@ -456,6 +464,15 @@ func (r *Reaper) downloadArtifactFile() error {
 		log.Errorf("s3 create client err:%s", err)
 		return err
 	}
+
+	// Quick connectivity check before download to fail fast if S3/Minio is unreachable
+	log.Infof("Checking S3/Minio connectivity before downloading artifact...")
+	if err = s3client.QuickValidateBucket(store.Bucket); err != nil {
+		log.Errorf("S3 connectivity check failed: %v", err)
+		return err
+	}
+	log.Infof("S3/Minio connectivity check passed.")
+
 	files, err := s3client.ListFiles(store.Bucket, store.GetObjectPath(r.Ctx.ArtifactInfo.FileName), false)
 	if err != nil {
 		log.Errorf("s3 list file err:%s", err)

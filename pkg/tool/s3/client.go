@@ -17,11 +17,13 @@ limitations under the License.
 package s3
 
 import (
+	"context"
 	"fmt"
 	"io/fs"
 	"mime"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/awserr"
@@ -72,6 +74,45 @@ func (c *Client) ValidateBucket(bucketName string) error {
 	_, err := c.ListObjects(listObjectInput)
 	if err != nil {
 		return fmt.Errorf("validate S3 error: %s", err.Error())
+	}
+
+	return nil
+}
+
+// QuickValidateBucket performs a quick connectivity check to S3/Minio with a short timeout (10 seconds)
+// to avoid long waits when the service is unreachable (e.g., DNS resolution failure, network issues).
+// This should be called before upload/download operations to fail fast.
+func (c *Client) QuickValidateBucket(bucketName string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	headBucketInput := &s3.HeadBucketInput{
+		Bucket: aws.String(bucketName),
+	}
+
+	req, _ := c.HeadBucketRequest(headBucketInput)
+	req.SetContext(ctx)
+
+	// Set a custom HTTP client with connection timeout to fail faster on network issues
+	req.HTTPRequest.Header.Set("Connection", "close")
+
+	err := req.Send()
+	if err != nil {
+		if aerr, ok := err.(awserr.Error); ok {
+			// If we get an AWS error code, it means we connected successfully but may not have permissions
+			// This is still a successful connectivity check
+			switch aerr.Code() {
+			case "Forbidden", "NotFound", s3.ErrCodeNoSuchBucket:
+				// Connection succeeded, but bucket doesn't exist or no permissions
+				// For cache operations, we still want to try the actual operation
+				log.Warnf("Bucket %s validation warning: %s. Will proceed with cache operation.", bucketName, aerr.Message())
+				return nil
+			default:
+				return fmt.Errorf("S3 connectivity check failed: %s", aerr.Message())
+			}
+		}
+		// Network error, timeout, or DNS failure
+		return fmt.Errorf("S3 connectivity check failed (network/timeout error): %w", err)
 	}
 
 	return nil
