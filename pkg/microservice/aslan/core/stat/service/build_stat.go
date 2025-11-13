@@ -322,26 +322,27 @@ func GetLatestTenBuildMeasure(productNames []string, log *zap.SugaredLogger) ([]
 }
 
 func GetTenDurationMeasure(startDate int64, endDate int64, productNames []string, log *zap.SugaredLogger) ([]*buildStatLatestTen, error) {
-	maxTenDurationBuildStats, err := mongodb.NewBuildStatColl().ListBuildStat(&models.BuildStatOption{StartDate: startDate, EndDate: endDate, Limit: config.LatestDay, Skip: 0, ProductNames: productNames})
+	// Query tasks directly from Task table, sorted by duration
+	tasks, err := commonmongodb.NewTaskColl().ListTasksByDuration(startDate, endDate, productNames, config.WorkflowType, config.LatestDay)
 	if err != nil {
-		log.Errorf("ListBuildStat err:%v", err)
-		return nil, fmt.Errorf("ListBuildStat err:%v", err)
+		log.Errorf("ListTasksByDuration err:%v", err)
+		return nil, fmt.Errorf("ListTasksByDuration err:%v", err)
 	}
-	latestTenPipelines := make([]*buildStatLatestTen, 0)
-	for _, buidStat := range maxTenDurationBuildStats {
-		task, err := commonmongodb.NewTaskColl().Find(buidStat.MaxDurationPipeline.TaskID, buidStat.MaxDurationPipeline.PipelineName, config.PipelineType(buidStat.MaxDurationPipeline.Type))
-		if err != nil {
-			log.Errorf("PipelineTask Find err:%v", err)
-			continue
-		}
 
+	latestTenPipelines := make([]*buildStatLatestTen, 0)
+	for _, task := range tasks {
 		buildStatLatestTen := &buildStatLatestTen{
-			PipelineInfo: buidStat.MaxDurationPipeline,
-			ProductName:  task.ProductName,
-			Duration:     task.EndTime - task.StartTime,
-			Status:       string(task.Status),
-			TaskCreator:  task.TaskCreator,
-			CreateTime:   task.CreateTime,
+			PipelineInfo: &models.PipelineInfo{
+				TaskID:       task.TaskID,
+				Type:         string(task.Type),
+				PipelineName: task.PipelineName,
+				MaxDuration:  task.EndTime - task.StartTime,
+			},
+			ProductName: task.ProductName,
+			Duration:    task.EndTime - task.StartTime,
+			Status:      string(task.Status),
+			TaskCreator: task.TaskCreator,
+			CreateTime:  task.CreateTime,
 		}
 		latestTenPipelines = append(latestTenPipelines, buildStatLatestTen)
 	}

@@ -644,6 +644,81 @@ func (c *TaskColl) ListAllTasks(option *ListAllTaskOption) ([]*task.Task, error)
 	return resp, nil
 }
 
+// ListTasksByDuration lists tasks within a time range, sorted by duration (end_time - start_time) in descending order
+func (c *TaskColl) ListTasksByDuration(startDate, endDate int64, productNames []string, taskType config.PipelineType, limit int) ([]*task.Task, error) {
+	resp := make([]*task.Task, 0)
+	query := bson.M{
+		"is_deleted": false,
+		"type":       taskType,
+	}
+
+	// Filter by time range
+	if startDate > 0 && endDate > 0 {
+		// If endDate is today or in the future, extend it to current time to include today's tasks
+		actualEndDate := endDate
+		now := time.Now().Unix()
+		todayStart := timeutil.BeginningOfDay().Unix()
+
+		if endDate >= todayStart {
+			// endDate is today or in the future, use current time as the upper limit
+			actualEndDate = now
+		}
+
+		query["create_time"] = bson.M{"$gte": startDate, "$lte": actualEndDate}
+	}
+
+	// Filter by product names
+	if len(productNames) > 0 {
+		query["product_name"] = bson.M{"$in": productNames}
+	}
+
+	// Only include completed tasks with valid end_time
+	query["status"] = bson.M{"$in": []string{
+		string(config.StatusPassed),
+		string(config.StatusFailed),
+		string(config.StatusTimeout),
+	}}
+	query["end_time"] = bson.M{"$gt": 0}
+
+	// Use aggregation to calculate duration and sort
+	pipeline := []bson.M{
+		{"$match": query},
+		{
+			"$addFields": bson.M{
+				"duration": bson.M{"$subtract": []string{"$end_time", "$start_time"}},
+			},
+		},
+		{"$sort": bson.M{"duration": -1}},
+		{"$limit": limit},
+		{
+			"$project": bson.M{
+				"task_id":      1,
+				"task_creator": 1,
+				"product_name": 1,
+				"pipeline_name": 1,
+				"status":       1,
+				"create_time":  1,
+				"start_time":   1,
+				"end_time":     1,
+				"type":         1,
+				"stages":       1,
+			},
+		},
+	}
+
+	cursor, err := c.Collection.Aggregate(context.TODO(), pipeline)
+	if err != nil {
+		return nil, err
+	}
+
+	err = cursor.All(context.TODO(), &resp)
+	if err != nil {
+		return nil, err
+	}
+
+	return resp, nil
+}
+
 func (c *TaskColl) UpdateUnfinishedTask(args *task.Task) error {
 	// avoid panic issue
 	if args == nil {
