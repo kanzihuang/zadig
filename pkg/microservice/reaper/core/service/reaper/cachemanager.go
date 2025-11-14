@@ -97,6 +97,31 @@ func (gcm *TarCacheManager) Archive(source, dest string) error {
 		return err
 	}
 
+	// Quick connectivity check BEFORE compression to avoid wasting time compressing if S3 is unreachable
+	store, err := gcm.getS3Storage()
+	if err != nil {
+		log.Errorf("Archive failed to get s3 storage: %v", err)
+		return err
+	}
+
+	forcedPathStyle := true
+	if store.Provider == setting.ProviderSourceAli {
+		forcedPathStyle = false
+	}
+	s3client, err := s3tool.NewClient(store.Endpoint, store.Ak, store.Sk, store.Insecure, forcedPathStyle)
+	if err != nil {
+		log.Errorf("Archive s3 create s3 client error: %+v", err)
+		return err
+	}
+
+	log.Infof("Checking S3/Minio connectivity before compressing cache...")
+	if err = s3client.QuickValidateBucket(store.Bucket); err != nil {
+		log.Errorf("Archive s3 connectivity check failed: %v", err)
+		return err
+	}
+	log.Infof("S3/Minio connectivity check passed.")
+
+	// Now compress the cache since S3 is reachable
 	temp, err := ioutil.TempFile("", "*reaper.tar.gz")
 	if err != nil {
 		log.Errorf("failed to create temp file %v", err)
@@ -105,6 +130,7 @@ func (gcm *TarCacheManager) Archive(source, dest string) error {
 
 	_ = temp.Close()
 
+	log.Infof("Compressing cache directory...")
 	cmd := exec.Command("tar", "czf", temp.Name(), "-C", source, ".")
 	cmd.Dir = source
 	cmd.Stderr = os.Stderr
@@ -113,36 +139,17 @@ func (gcm *TarCacheManager) Archive(source, dest string) error {
 		log.Errorf("failed to compress cache %v", err)
 		return err
 	}
+	log.Infof("Cache compression completed.")
 
 	//if err = helper.Move(temp.Name(), dest); err != nil {
 	//	log.Errorf("failed to upload cache to shared fs %v", err)
 	//	return err
 	//}
 
-	if store, err := gcm.getS3Storage(); err == nil {
-		forcedPathStyle := true
-		if store.Provider == setting.ProviderSourceAli {
-			forcedPathStyle = false
-		}
-		s3client, err := s3tool.NewClient(store.Endpoint, store.Ak, store.Sk, store.Insecure, forcedPathStyle)
-		if err != nil {
-			log.Errorf("Archive s3 create s3 client error: %+v", err)
-			return err
-		}
-
-		// Quick connectivity check before upload to fail fast if S3/Minio is unreachable
-		log.Infof("Checking S3/Minio connectivity before uploading cache...")
-		if err = s3client.QuickValidateBucket(store.Bucket); err != nil {
-			log.Errorf("Archive s3 connectivity check failed: %v", err)
-			return err
-		}
-		log.Infof("S3/Minio connectivity check passed.")
-
-		objectKey := store.GetObjectPath(meta.FileName)
-		if err = s3client.Upload(store.Bucket, temp.Name(), objectKey); err != nil {
-			log.Errorf("Archive s3 upload err:%v", err)
-			return err
-		}
+	objectKey := store.GetObjectPath(meta.FileName)
+	if err = s3client.Upload(store.Bucket, temp.Name(), objectKey); err != nil {
+		log.Errorf("Archive s3 upload err:%v", err)
+		return err
 	}
 
 	return nil

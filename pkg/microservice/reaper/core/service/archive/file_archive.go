@@ -181,6 +181,31 @@ func (c *WorkspaceAchiever) Achieve(target string) ([]string, error) {
 		return nil, err
 	}
 
+	// Quick connectivity check BEFORE compression to avoid wasting time compressing if S3 is unreachable
+	store, err := s3.NewS3StorageFromEncryptedURI(c.StorageURI, c.aesKey)
+	if err != nil {
+		log.Errorf("Archive failed to get s3 storage: %v", err)
+		return nil, err
+	}
+
+	forcedPathStyle := true
+	if store.Provider == setting.ProviderSourceAli {
+		forcedPathStyle = false
+	}
+	s3client, err := s3tool.NewClient(store.Endpoint, store.Ak, store.Sk, store.Insecure, forcedPathStyle)
+	if err != nil {
+		log.Errorf("Archive s3 create s3 client error: %+v", err)
+		return nil, err
+	}
+
+	log.Infof("Checking S3/Minio connectivity before compressing workspace cache...")
+	if err = s3client.QuickValidateBucket(store.Bucket); err != nil {
+		log.Errorf("Archive s3 connectivity check failed: %v", err)
+		return nil, err
+	}
+	log.Infof("S3/Minio connectivity check passed.")
+
+	// Now compress the cache since S3 is reachable
 	f, err := ioutil.TempFile("", "*cached_files.txt")
 	if err != nil {
 		return nil, err
@@ -226,30 +251,10 @@ func (c *WorkspaceAchiever) Achieve(target string) ([]string, error) {
 	//	return err
 	//}
 
-	if store, err := s3.NewS3StorageFromEncryptedURI(c.StorageURI, c.aesKey); err == nil {
-		forcedPathStyle := true
-		if store.Provider == setting.ProviderSourceAli {
-			forcedPathStyle = false
-		}
-		s3client, err := s3tool.NewClient(store.Endpoint, store.Ak, store.Sk, store.Insecure, forcedPathStyle)
-		if err != nil {
-			log.Errorf("Archive s3 create s3 client error: %+v", err)
-			return nil, err
-		}
-
-		// Quick connectivity check before upload to fail fast if S3/Minio is unreachable
-		log.Infof("Checking S3/Minio connectivity before uploading workspace cache...")
-		if err = s3client.QuickValidateBucket(store.Bucket); err != nil {
-			log.Errorf("Archive s3 connectivity check failed: %v", err)
-			return nil, err
-		}
-		log.Infof("S3/Minio connectivity check passed.")
-
-		objectKey := store.GetObjectPath(fmt.Sprintf("%s/%s/%s/%s", c.PipelineName, c.ServiceName, "cache", meta.FileName))
-		if err = s3client.Upload(store.Bucket, temp.Name(), objectKey); err != nil {
-			log.Errorf("Archive s3 upload err:%v", err)
-			return nil, err
-		}
+	objectKey := store.GetObjectPath(fmt.Sprintf("%s/%s/%s/%s", c.PipelineName, c.ServiceName, "cache", meta.FileName))
+	if err = s3client.Upload(store.Bucket, temp.Name(), objectKey); err != nil {
+		log.Errorf("Archive s3 upload err:%v", err)
+		return nil, err
 	}
 
 	return c.paths, nil
