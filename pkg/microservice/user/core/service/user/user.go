@@ -165,9 +165,31 @@ func GetUser(uid string, logger *zap.SugaredLogger) (*types.UserInfo, error) {
 	}
 	userInfo := mergeUserLogin([]models.User{*user}, []models.UserLogin{*userLogin}, logger)
 	userInfoRes := &userInfo[0]
-	userInfoRes.APIToken = user.APIToken
-	//TODO Create a permanent OpenAPI token
-	if user.APIToken == "" {
+
+	// Validate existing token and regenerate if invalid
+	needNewToken := true
+	if user.APIToken != "" {
+		// Verify if the existing token is valid with current SECRET_KEY
+		_, err := jwt.ParseWithClaims(user.APIToken, &login.Claims{}, func(token *jwt.Token) (interface{}, error) {
+			// Validate signing method
+			if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+				return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
+			}
+			return []byte(configbase.SecretKey()), nil
+		})
+		if err == nil {
+			// Token is valid, can continue using it
+			needNewToken = false
+			userInfoRes.APIToken = user.APIToken
+			logger.Infof("User %s has valid API token", user.Account)
+		} else {
+			// Token is invalid (e.g., signed with old SECRET_KEY), need to regenerate
+			logger.Warnf("User %s has invalid API token (error: %v), will regenerate", user.Account, err)
+		}
+	}
+
+	if needNewToken {
+		// Generate new token
 		token, err := login.CreateToken(&login.Claims{
 			Name:              user.Name,
 			UID:               user.UID,
@@ -184,7 +206,7 @@ func GetUser(uid string, logger *zap.SugaredLogger) (*types.UserInfo, error) {
 			},
 		})
 		if err != nil {
-			logger.Errorf("LocalLogin user:%s create token error, error msg:%s", user.Account, err.Error())
+			logger.Errorf("GetUser user:%s create token error, error msg:%s", user.Account, err.Error())
 			return nil, err
 		}
 		userInfoRes.APIToken = token
@@ -193,9 +215,10 @@ func GetUser(uid string, logger *zap.SugaredLogger) (*types.UserInfo, error) {
 		}
 		err = orm.UpdateUser(uid, userWithToken, core.DB)
 		if err != nil {
-			logger.Errorf("UpdateUser user:%s save token error:%s", user.Account, err.Error())
+			logger.Errorf("UpdateUser user:%s save new token error:%s", user.Account, err.Error())
 			return nil, err
 		}
+		logger.Infof("User %s API token regenerated successfully", user.Account)
 	}
 	return userInfoRes, nil
 }
