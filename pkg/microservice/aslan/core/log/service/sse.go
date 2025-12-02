@@ -232,6 +232,7 @@ func WorkflowTaskV4ContainerLogStream(ctx context.Context, streamChan chan inter
 					return
 				}
 				options.ClusterID = jobSpec.Properties.ClusterID
+				log.Infof("Job %s type %s: extracted ClusterID from job spec = '%s'", job.Name, job.JobType, options.ClusterID)
 			case string(config.JobPlugin):
 				jobSpec := &commonmodels.JobTaskPluginSpec{}
 				if err := commonmodels.IToi(job.Spec, jobSpec); err != nil {
@@ -244,13 +245,17 @@ func WorkflowTaskV4ContainerLogStream(ctx context.Context, streamChan chan inter
 				return
 			}
 			if options.ClusterID == "" {
+				log.Warnf("ClusterID is empty for job %s, defaulting to LocalClusterID", job.Name)
 				options.ClusterID = setting.LocalClusterID
 			}
+			log.Infof("Final ClusterID for job %s: '%s'", job.Name, options.ClusterID)
 			switch options.ClusterID {
 			case setting.LocalClusterID:
 				options.Namespace = config.Namespace()
+				log.Infof("Using local cluster, namespace: %s", options.Namespace)
 			default:
 				options.Namespace = setting.AttachedClusterNamespace
+				log.Infof("Using remote cluster, namespace: %s", options.Namespace)
 			}
 			break
 		}
@@ -289,6 +294,7 @@ func waitAndGetLog(ctx context.Context, streamChan chan interface{}, selector la
 	PodCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
+	log.Infof("Waiting for pod to run. ClusterID='%s', Namespace='%s', LabelSelector='%s'", options.ClusterID, options.Namespace, selector.String())
 	log.Debugf("Waiting until pod is running before establishing the stream. labelSelector: %+v, clusterId: %s, namespace: %s", selector, options.ClusterID, options.Namespace)
 	clientSet, err := kubeclient.GetClientset(config.HubServerAddress(), options.ClusterID)
 	if err != nil {
@@ -314,6 +320,7 @@ func waitAndGetLog(ctx context.Context, streamChan chan interface{}, selector la
 		return
 	}
 
+	log.Infof("Found %d pods matching selector in ClusterID='%s', Namespace='%s'", len(pods), options.ClusterID, options.Namespace)
 	log.Debugf("Found %d running pods", len(pods))
 
 	if len(pods) > 0 {
